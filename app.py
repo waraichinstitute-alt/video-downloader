@@ -59,15 +59,24 @@ def _get_html(page_url: str) -> str:
 
 
 def _extract_candidates(html: str, base: str, add):
+    html = html.replace("\\/", "/")  # unescape JSON-style slashes
     patterns = [
         r'<video[^>]+src=["\']([^"\']+)["\']',
+        r'<video[^>]+data-src=["\']([^"\']+)["\']',
         r'<source[^>]+src=["\']([^"\']+)["\']',
+        r'<source[^>]+data-src=["\']([^"\']+)["\']',
         r'<meta[^>]+property=["\']og:video(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
         r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:video(?::secure_url)?["\']',
         r'<meta[^>]+name=["\']twitter:player:stream["\'][^>]+content=["\']([^"\']+)["\']',
+        # JS player configs (jwplayer / videojs style):  file: "https://..." / src: '...'
+        r'(?:file|src)\s*:\s*["\'](https?://[^"\']+)["\']',
     ]
     for pat in patterns:
         for m in re.finditer(pat, html, re.IGNORECASE):
+            add(m.group(1), base)
+    # plain download anchors pointing at video files
+    for m in re.finditer(r'<a[^>]+href=["\']([^"\']+)["\']', html, re.IGNORECASE):
+        if _looks_like_video(urljoin(base, m.group(1).strip())):
             add(m.group(1), base)
     # any quoted http(s) URL ending in a video extension (catches JS-embedded URLs)
     exts = "|".join(_VIDEO_EXTS)
@@ -177,10 +186,15 @@ st.caption("Paste a link, get the file. YouTube, TikTok, Instagram, X and a thou
            "straight from the source with no size limit. "
            "See a video playing on some page? “Find video on page” hunts it down in the page's code.")
 
-url = st.text_input("Link", placeholder="Paste video or page link…")
-quality = st.radio("Mode",
-                   ["720p or smaller", "Best quality", "Audio only (MP3)",
-                    "Direct link (big files)", "🔍 Find video on page"])
+# Optional ?url= prefill (lets an iPhone Shortcut hand a link straight in).
+_prefill = st.query_params.get("url", "") or ""
+_modes = ["720p or smaller", "Best quality", "Audio only (MP3)",
+          "Direct link (big files)", "🔍 Find video on page"]
+_default_mode = ("Direct link (big files)" if _looks_like_video(_prefill)
+                 else "720p or smaller")
+
+url = st.text_input("Link", value=_prefill, placeholder="Paste video or page link…")
+quality = st.radio("Mode", _modes, index=_modes.index(_default_mode))
 
 if st.button("Download", type="primary"):
     url = (url or "").strip()
