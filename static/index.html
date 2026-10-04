@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Video Downloader</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, system-ui, sans-serif;
+         background: #0f1220; color: #eef; min-height: 100vh;
+         display: flex; justify-content: center; padding: 32px 16px; }
+  main { width: 100%; max-width: 480px; }
+  h1 { font-size: 28px; margin: 0 0 6px; }
+  .sub { color: #9aa; margin: 0 0 20px; font-size: 15px; }
+  input[type=url] { width: 100%; padding: 14px; font-size: 16px; border-radius: 12px;
+    border: 1px solid #334; background: #1a1f36; color: #eef; margin-bottom: 14px; }
+  .quals { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+  .quals label { flex: 1; min-width: 120px; text-align: center; padding: 10px 6px;
+    border: 1px solid #334; border-radius: 12px; font-size: 14px; cursor: pointer; }
+  .quals input { display: none; }
+  .quals input:checked + span { font-weight: 700; }
+  .quals label:has(input:checked) { border-color: #6c8cff; background: #1c2450; }
+  button { width: 100%; padding: 15px; font-size: 17px; font-weight: 700;
+    border: 0; border-radius: 12px; background: #4c6fff; color: #fff; cursor: pointer; }
+  button:disabled { opacity: .5; }
+  #status { min-height: 24px; color: #9aa; font-size: 14px; margin: 14px 0; }
+  #dl { display: block; text-align: center; padding: 15px; border-radius: 12px;
+    background: #1f9d55; color: #fff; font-weight: 700; font-size: 17px;
+    text-decoration: none; margin-bottom: 8px; }
+  #dl[hidden] { display: none; }
+  .fine { color: #667; font-size: 12px; text-align: center; margin-top: 24px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>&#x2b07;&#xfe0f; Video Downloader</h1>
+  <p class="sub">Paste a link, get the file. YouTube, TikTok, Instagram, X and a thousand more sites.</p>
+  <input id="url" type="url" placeholder="Paste video link&hellip;" autocomplete="off" autocapitalize="off">
+  <div class="quals">
+    <label><input type="radio" name="q" value="best" checked><span>Best quality</span></label>
+    <label><input type="radio" name="q" value="720p"><span>720p / smaller</span></label>
+    <label><input type="radio" name="q" value="audio"><span>Audio MP3</span></label>
+  </div>
+  <button id="go">Download</button>
+  <p id="status"></p>
+  <a id="dl" hidden></a>
+  <p class="fine">Won't work on Netflix, Spotify or Disney+ (DRM-protected).</p>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const status = t => { $("status").textContent = t; };
+$("go").onclick = async () => {
+  const url = $("url").value.trim();
+  const quality = document.querySelector('input[name=q]:checked').value;
+  if (!url) { status("Paste a link first."); return; }
+  $("dl").hidden = true; $("go").disabled = true; status("Starting\u2026");
+  try {
+    const r = await fetch("/api/fetch", { method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ url, quality }) });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || "Couldn't start.");
+    poll(d.job_id);
+  } catch (e) { status("Error: " + e.message); $("go").disabled = false; }
+};
+async function poll(id) {
+  try {
+    const j = await (await fetch("/api/job/" + id)).json();
+    if (j.status === "done") {
+      status("Done \u2014 " + j.title + " (" + j.size_mb + " MB)");
+      const a = $("dl");
+      a.href = j.file; a.hidden = false;
+      a.textContent = "\u2b07\ufe0f Tap to save your file";
+      $("go").disabled = false;
+    } else if (j.status === "error") {
+      status(j.detail); $("go").disabled = false;
+    } else {
+      status(j.status === "queued" ? "In queue\u2026" : "Downloading\u2026 big videos can take a minute.");
+      setTimeout(() => poll(id), 2000);
+    }
+  } catch (e) { status("Lost connection, retrying\u2026"); setTimeout(() => poll(id), 3000); }
+}
+</script>
+</body>
+</html>
