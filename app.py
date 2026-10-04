@@ -4,7 +4,9 @@ import os
 import re
 import time
 import uuid
+from urllib.parse import urljoin, urlparse
 
+import requests
 import streamlit as st
 import yt_dlp
 
@@ -12,6 +14,11 @@ WORKDIR = "/tmp/vd-downloads"
 os.makedirs(WORKDIR, exist_ok=True)
 _MAX_AGE = 2 * 3600
 _MAX_BYTES = 250 * 1_000_000  # free server guardrail (through-server downloads)
+
+_BROWSER_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) "
+               "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 "
+               "Mobile/15E148 Safari/604.1")
+_VIDEO_EXTS = ("mp4", "m3u8", "mpd", "webm", "mov", "m4v", "ogv")
 
 
 def _cleanup():
@@ -38,6 +45,98 @@ def _friendly_error(exc: Exception) -> str:
     if "unsupported url" in low:
         return "That link isn't a video/file this downloader understands."
     return "Couldn't fetch that link: " + msg[:220]
+
+
+# ---- "Find video on page" mode -------------------------------------------
+# Reads a page's HTML (plus one level of embedded iframes) and collects the
+# video file addresses written in its code. The phone then downloads the
+# chosen one straight from the source.
+
+def _get_html(page_url: str) -> str:
+    r = requests.get(page_url, headers={"User-Agent": _BROWSER_UA}, timeout=20)
+    r.raise_for_status()
+    return r.text
+
+
+def _extract_candidates(html: str, base: str, add):
+    patterns = [
+        r'<video[^>]+src=["\']([^"\']+)["\']',
+        r'<source[^>]+src=["\']([^"\']+)["\']',
+        r'<meta[^>]+property=["\']og:video(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:video(?::secure_url)?["\']',
+        r'<meta[^>]+name=["\']twitter:player:stream["\'][^>]+content=["\']([^"\']+)["\']',
+    ]
+    for pat in patterns:
+        for m in re.finditer(pat, html, re.IGNORECASE):
+            add(m.group(1), base)
+    # any quoted http(s) URL ending in a video extension (catches JS-embedded URLs)
+    exts = "|".join(_VIDEO_EXTS)
+    for m in re.finditer(r'["\'](https?://[^"\']+?\.(?:' + exts + r')(?:\?[^"\']*)?)["\']',
+                         html, re.IGNORECASE):
+        add(m.group(1), base)
+
+
+def _iframe_srcs(html: str, base: str):
+    srcs = []
+    for m in re.finditer(r'<iframe[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE):
+        u = urljoin(base, m.group(1).strip())
+        if u.startswith("http"):
+            srcs.append(u)
+    return srcs
+
+
+def _looks_like_video(u: str) -> bool:
+    path = urlparse(u).path.lower()
+    return any(path.endswith("." + e) for e in _VIDEO_EXTS)
+
+
+def _probe(u: str):
+    """HEAD the URL. Returns (size_bytes_or_None, is_video_bool)."""
+    try:
+        r = requests.head(u, headers={"User-Agent": _BROWSER_UA},
+                          timeout=8, allow_redirects=True)
+        if r.status_code >= 400:
+            return None, False
+        ctype = (r.headers.get("content-type") or "").lower()
+        size = r.headers.get("content-length")
+        size = int(size) if size and size.isdigit() else None
+        ok = ("video" in ctype or "mpegurl" in ctype
+              or "mp2t" in ctype or "dash" in ctype)
+        return size, ok
+    except Exception:
+        return None, False
+
+
+def find_page_videos(page_url: str):
+    seen = set()
+    cands = []
+
+    def add(u, base):
+        u = urljoin(base, (u or "").strip())
+        if not u.startswith("http") or u in seen:
+            return
+        seen.add(u)
+        cands.append(u)
+
+    html = _get_html(page_url)
+    _extract_candidates(html, page_url, add)
+    for src in _iframe_srcs(html, page_url)[:5]:
+        try:
+            _extract_candidates(_get_html(src), src, add)
+        except Exception:
+            pass
+
+    results = []
+    for u in cands:
+        if len(results) >= 10:
+            break
+        size, is_video = _probe(u)
+        if not _looks_like_video(u) and not is_video:
+            continue
+        ext = urlparse(u).path.rsplit(".", 1)[-1].lower()[:4]
+        results.append({"url": u, "size": size, "ext": ext,
+                        "host": urlparse(u).netloc})
+    return results
 
 
 def _pick_direct(info):
@@ -68,18 +167,20 @@ def _pick_direct(info):
             best.get("ext") or "", is_hls)
 
 
+# ---- UI -------------------------------------------------------------------
+
 st.set_page_config(page_title="Video Downloader", page_icon="⬇️")
 st.title("⬇️ Video Downloader")
 st.caption("Paste a link, get the file. YouTube, TikTok, Instagram, X and a thousand more "
            "sites. Won't work on Netflix, Spotify or Disney+ (DRM-protected). "
            "Got a huge file? Use “Direct link (big files)” — your phone grabs it "
-           "straight from the source with no size limit.")
+           "straight from the source with no size limit. "
+           "See a video playing on some page? “Find video on page” hunts it down in the page's code.")
 
-url = st.text_input("Link", placeholder="Paste video link…")
-quality = st.radio("Quality",
+url = st.text_input("Link", placeholder="Paste video or page link…")
+quality = st.radio("Mode",
                    ["720p or smaller", "Best quality", "Audio only (MP3)",
-                    "Direct link (big files)"],
-                   horizontal=True)
+                    "Direct link (big files)", "🔍 Find video on page"])
 
 if st.button("Download", type="primary"):
     url = (url or "").strip()
@@ -87,6 +188,33 @@ if st.button("Download", type="primary"):
         st.error("Paste a valid link starting with http(s)://")
         st.stop()
     _cleanup()
+
+    if quality.startswith("🔍"):
+        with st.spinner("Reading the page and hunting for videos…"):
+            try:
+                vids = find_page_videos(url)
+            except requests.RequestException:
+                st.error("That page blocks automatic reading (bot protection). "
+                         "Your phone's browser is the only thing allowed in there, "
+                         "so the server can't see its videos.")
+                st.stop()
+            except Exception as exc:  # noqa: BLE001 - surfaced nicely
+                st.error(_friendly_error(exc))
+                st.stop()
+            if not vids:
+                st.warning("No downloadable videos found in that page's code. "
+                           "Its player probably builds the video with live scripts, "
+                           "which only your phone's browser can see — the server can't.")
+            else:
+                n = len(vids)
+                st.success(f"Found {n} video{'s' if n != 1 else ''} on that page:")
+                for v in vids:
+                    size_txt = (f" (~{v['size'] / 1_000_000:.0f} MB)"
+                                if v["size"] else " (size unknown)")
+                    st.link_button(f"⬇️ Open video{size_txt} — {v['host']}", v["url"])
+                    if v["ext"] == "m3u8":
+                        st.caption("Stream link — your iPhone can play it but not save it.")
+        st.stop()
 
     if quality.startswith("Direct"):
         with st.spinner("Finding the direct file link…"):
