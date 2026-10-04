@@ -1,2 +1,2 @@
 streamlit
-yt-dlp[default,curl-cffi]
+yt-dlp

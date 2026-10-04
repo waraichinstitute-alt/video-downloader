@@ -25,7 +25,8 @@ def _cleanup():
             pass
 
 
-def _friendly_error(msg: str) -> str:
+def _friendly_error(exc: Exception) -> str:
+    msg = str(exc).strip() or f"{type(exc).__name__} (no detail given)"
     low = msg.lower()
     if "sign in to confirm" in low or "not a bot" in low:
         return ("YouTube asked for bot verification on this one. "
@@ -69,7 +70,6 @@ if st.button("Download", type="primary"):
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "impersonate": "chrome",
         "merge_output_format": "mp4",
     }
     if audio_only:
@@ -101,4 +101,4 @@ if st.button("Download", type="primary"):
             st.download_button("⬇️ Tap to save your file", data=data,
                                file_name=f"download.{ext}")
         except Exception as exc:  # noqa: BLE001 - surfaced nicely
-            st.error(_friendly_error(str(exc)))
+            st.error(_friendly_error(exc))
