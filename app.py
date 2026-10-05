@@ -2,7 +2,6 @@
 
 import os
 import re
-import shutil
 import time
 import uuid
 from urllib.parse import urljoin, urlparse
@@ -16,28 +15,34 @@ os.makedirs(WORKDIR, exist_ok=True)
 _MAX_AGE = 2 * 3600
 _MAX_BYTES = 250 * 1_000_000  # free server guardrail (through-server downloads)
 
-# Finished files get a real public URL so iPhones can long-press → Download.
-# Streamlit serves ./static at <app>/app/static/.
-_HERE = os.path.dirname(os.path.abspath(__file__))
-STATIC_DL = os.path.join(_HERE, "static", "dl")
-os.makedirs(STATIC_DL, exist_ok=True)
-APP_URL = "https://video-downloader-vgdj9xw7eceyjq9zkpd5re.streamlit.app"
-
 _BROWSER_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) "
                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 "
                "Mobile/15E148 Safari/604.1")
 _VIDEO_EXTS = ("mp4", "m3u8", "mpd", "webm", "mov", "m4v", "ogv")
 
-# ---- Download log (admin can see every download) ---------------------------
-_LOG_URL = "https://video-downloader-log.waraichinstitute.workers.dev/api/log"
-_LOG_KEY = "4fa5a0a927bfc19ccb701f330d2d8f6b7d918b2034e0d4d7"
+# ---- Download log + iPhone relay (Cloudflare worker) ------------------------
+_WORKER = "https://video-downloader-log.waraichinstitute.workers.dev"
+_LOG_URL = f"{_WORKER}/api/log"
+_CHUNK_URL = f"{_WORKER}/api/chunk"
+_RELAY_CHUNK = 20 * 1024 * 1024  # 20MB per POST (worker/KV limits)
+
+
+def _dl_key():
+    """Shared secret from Streamlit secrets — never in the public repo."""
+    try:
+        return st.secrets.get("DL_KEY", "")
+    except Exception:
+        return ""
 
 
 def _log_download(vurl, mode, title=""):
     """Record a download for the admin log. Never breaks the download."""
+    key = _dl_key()
+    if not key:
+        return
     try:
         requests.post(_LOG_URL, json={
-            "key": _LOG_KEY,
+            "key": key,
             "url": vurl,
             "mode": mode,
             "title": (title or "")[:160],
@@ -47,18 +52,51 @@ def _log_download(vurl, mode, title=""):
         pass
 
 
+def _relay_upload(path, filename, size):
+    """Push the finished file to the Cloudflare relay in 20MB chunks.
+
+    Returns a tap-to-download URL (forced attachment headers) or None.
+    """
+    key = _dl_key()
+    if not key:
+        return None
+    fid = uuid.uuid4().hex[:16]
+    total = (size + _RELAY_CHUNK - 1) // _RELAY_CHUNK
+    try:
+        prog = st.progress(0, text="Preparing your iPhone download…")
+        with open(path, "rb") as f:
+            for i in range(total):
+                chunk = f.read(_RELAY_CHUNK)
+                data = {"key": key, "id": fid,
+                        "index": str(i), "total": str(total)}
+                if i == 0:
+                    data["name"] = filename
+                    data["size"] = str(size)
+                r = requests.post(_CHUNK_URL, data=data,
+                                  files={"file": (f"chunk{i}", chunk)},
+                                  timeout=180)
+                if r.status_code != 200 or not r.json().get("ok"):
+                    prog.empty()
+                    return None
+                prog.progress((i + 1) / total,
+                              text=f"Preparing your iPhone download… ({i + 1}/{total})")
+        prog.empty()
+    except Exception:
+        return None
+    return f"{_WORKER}/f/{fid}"
+
+
 def _cleanup():
     now = time.time()
-    for d in (WORKDIR, STATIC_DL):
-        if not os.path.isdir(d):
-            continue
-        for name in os.listdir(d):
-            path = os.path.join(d, name)
-            try:
-                if now - os.path.getmtime(path) > _MAX_AGE:
-                    os.remove(path)
-            except OSError:
-                pass
+    if not os.path.isdir(WORKDIR):
+        return
+    for name in os.listdir(WORKDIR):
+        path = os.path.join(WORKDIR, name)
+        try:
+            if now - os.path.getmtime(path) > _MAX_AGE:
+                os.remove(path)
+        except OSError:
+            pass
 
 
 def _friendly_error(exc: Exception) -> str:
@@ -338,23 +376,24 @@ if st.button("Download", type="primary"):
                 st.stop()
             ext = name.rsplit(".", 1)[-1]
             title = (info.get("title") or "video")[:60]
-            # Move to the public static dir so the file has a real URL
-            # (iPhone long-press → Download Linked File needs one).
             safe = re.sub(r"[^a-zA-Z0-9_-]+", "_", title).strip("_")[:40] or "video"
-            pub_name = f"{safe}_{tag}.{ext}"
-            pub_path = os.path.join(STATIC_DL, pub_name)
-            shutil.move(path, pub_path)  # works across filesystems, unlike os.replace
-            file_url = f"{APP_URL}/app/static/dl/{pub_name}"
-            with open(pub_path, "rb") as f:
-                data = f.read()
+            filename = f"{safe}_{tag}.{ext}"
             st.success(f"Done — {title} ({size / 1_000_000:.1f} MB)")
             _log_download(url, "audio-mp3" if audio_only
                           else "best" if quality.startswith("Best") else "720p",
                           title)
-            st.download_button("⬇️ Tap to save your file", data=data,
-                               file_name=f"download.{ext}")
-            st.link_button("🔗 Direct file link — iPhone: long-press → Download Linked File",
-                           file_url)
-            _iphone_tip()
+            # Relay the file to Cloudflare so the iPhone gets a forced
+            # download (tap the link — no long-press needed).
+            dl_url = _relay_upload(path, filename, size)
+            if dl_url:
+                st.link_button("⬇️ Download to iPhone — just tap it", dl_url)
+                st.caption("Tapping saves the file straight to your Files app. "
+                           "The link expires in 2 hours.")
+            else:
+                with open(path, "rb") as f:
+                    data = f.read()
+                st.download_button("⬇️ Tap to save your file", data=data,
+                                   file_name=filename)
+                _iphone_tip()
         except Exception as exc:  # noqa: BLE001 - surfaced nicely
             st.error(_friendly_error(exc))
