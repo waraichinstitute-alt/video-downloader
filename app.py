@@ -15,6 +15,13 @@ os.makedirs(WORKDIR, exist_ok=True)
 _MAX_AGE = 2 * 3600
 _MAX_BYTES = 250 * 1_000_000  # free server guardrail (through-server downloads)
 
+# Finished files get a real public URL so iPhones can long-press → Download.
+# Streamlit serves ./static at <app>/app/static/.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+STATIC_DL = os.path.join(_HERE, "static", "dl")
+os.makedirs(STATIC_DL, exist_ok=True)
+APP_URL = "https://video-downloader-vgdj9xw7eceyjq9zkpd5re.streamlit.app"
+
 _BROWSER_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) "
                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 "
                "Mobile/15E148 Safari/604.1")
@@ -41,13 +48,16 @@ def _log_download(vurl, mode, title=""):
 
 def _cleanup():
     now = time.time()
-    for name in os.listdir(WORKDIR):
-        path = os.path.join(WORKDIR, name)
-        try:
-            if now - os.path.getmtime(path) > _MAX_AGE:
-                os.remove(path)
-        except OSError:
-            pass
+    for d in (WORKDIR, STATIC_DL):
+        if not os.path.isdir(d):
+            continue
+        for name in os.listdir(d):
+            path = os.path.join(d, name)
+            try:
+                if now - os.path.getmtime(path) > _MAX_AGE:
+                    os.remove(path)
+            except OSError:
+                pass
 
 
 def _friendly_error(exc: Exception) -> str:
@@ -195,8 +205,8 @@ def _pick_direct(info):
 
 
 def _iphone_tip():
-    st.caption("📱 iPhone tip: if the video plays instead of saving, tap **Share → Save to Files**. "
-               "Or long-press the button → **Download Linked File**.")
+    st.caption("📱 iPhone: **long-press** a link → **Download Linked File** to save it. "
+               "Just tapping plays the video instead.")
 
 
 # ---- UI -------------------------------------------------------------------
@@ -327,7 +337,14 @@ if st.button("Download", type="primary"):
                 st.stop()
             ext = name.rsplit(".", 1)[-1]
             title = (info.get("title") or "video")[:60]
-            with open(path, "rb") as f:
+            # Move to the public static dir so the file has a real URL
+            # (iPhone long-press → Download Linked File needs one).
+            safe = re.sub(r"[^a-zA-Z0-9_-]+", "_", title).strip("_")[:40] or "video"
+            pub_name = f"{safe}_{tag}.{ext}"
+            pub_path = os.path.join(STATIC_DL, pub_name)
+            os.replace(path, pub_path)
+            file_url = f"{APP_URL}/app/static/dl/{pub_name}"
+            with open(pub_path, "rb") as f:
                 data = f.read()
             st.success(f"Done — {title} ({size / 1_000_000:.1f} MB)")
             _log_download(url, "audio-mp3" if audio_only
@@ -335,6 +352,8 @@ if st.button("Download", type="primary"):
                           title)
             st.download_button("⬇️ Tap to save your file", data=data,
                                file_name=f"download.{ext}")
+            st.link_button("🔗 Direct file link — iPhone: long-press → Download Linked File",
+                           file_url)
             _iphone_tip()
         except Exception as exc:  # noqa: BLE001 - surfaced nicely
             st.error(_friendly_error(exc))
