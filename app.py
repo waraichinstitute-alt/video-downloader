@@ -148,9 +148,9 @@ def _friendly_error(exc: Exception) -> str:
         return ("YouTube refused the download (their bot protection). "
                 "Wait a while and try again, or try a different video.")
     if "429" in low or "too many requests" in low:
-        return ("Instagram is limiting requests right now (too many from this "
-                "server). Wait 10–15 minutes and try again — this usually "
-                "clears on its own.")
+        return ("Instagram is blocking downloads from this server right now "
+                "(their anti-bot system). This usually clears in 10–15 minutes. "
+                "Try again in a bit, or try a non-Instagram link — those work fine.")
     if "drm" in low or "encrypted" in low:
         return "This video is DRM-protected (like Netflix/Spotify). No downloader can grab those."
     if "login required" in low or "log in" in low:
@@ -323,9 +323,11 @@ def _fetch_info(url):
     """Read what's available without downloading. Returns a dict.
 
     Tries YouTube player clients in order until one works.
+    For rate limits (429), waits and retries automatically.
     """
     info = None
     last_exc = None
+    is_yt = "youtube" in url.lower() or "youtu.be" in url.lower()
     for ci in range(len(_YT_CLIENT_FALLBACKS)):
         try:
             with yt_dlp.YoutubeDL(_ytdl_base(ci)) as ydl:
@@ -333,10 +335,20 @@ def _fetch_info(url):
             break
         except Exception as exc:  # noqa: BLE001 - try next client
             last_exc = exc
+            low = str(exc).lower()
+            # Instagram rate limit: one automatic retry after a short pause.
+            # If the IP is persistently flagged, fail fast with a clear message.
+            if ("429" in low or "too many requests" in low) and ci == 0:
+                time.sleep(20)
+                try:
+                    with yt_dlp.YoutubeDL(_ytdl_base(ci)) as ydl:
+                        info = ydl.extract_info(url, download=False)
+                    break
+                except Exception as exc2:  # noqa: BLE001
+                    last_exc = exc2
             # Only retry with another client for YouTube bot/403 blocks;
             # other sites fail fast.
-            low = str(exc).lower()
-            if "youtube" not in url.lower() or not (
+            if not is_yt or not (
                     "not a bot" in low or "sign in to confirm" in low
                     or "403" in low or "forbidden" in low):
                 break
