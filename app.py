@@ -2,6 +2,7 @@
 
 import os
 import re
+import shutil
 import time
 import uuid
 from urllib.parse import urljoin, urlparse
@@ -342,7 +343,7 @@ if st.button("Download", type="primary"):
             safe = re.sub(r"[^a-zA-Z0-9_-]+", "_", title).strip("_")[:40] or "video"
             pub_name = f"{safe}_{tag}.{ext}"
             pub_path = os.path.join(STATIC_DL, pub_name)
-            os.replace(path, pub_path)
+            shutil.move(path, pub_path)  # works across filesystems, unlike os.replace
             file_url = f"{APP_URL}/app/static/dl/{pub_name}"
             with open(pub_path, "rb") as f:
                 data = f.read()
