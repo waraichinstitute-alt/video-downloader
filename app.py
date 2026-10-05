@@ -22,13 +22,22 @@ _BROWSER_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) "
 _VIDEO_EXTS = ("mp4", "m3u8", "mpd", "webm", "mov", "m4v", "ogv")
 
 # YouTube blocks datacenter IPs with "Sign in to confirm you're not a bot".
-# The android player client bypasses it (falls back to web client).
-_YTDL_BASE = {
-    "quiet": True,
-    "no_warnings": True,
-    "noplaylist": True,
-    "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
-}
+# Try player clients in order; if one is blocked, fall back to the next.
+_YT_CLIENT_FALLBACKS = [
+    {"youtube": {"player_client": ["android", "web"]}},
+    {"youtube": {"player_client": ["ios", "web"]}},
+    {"youtube": {"player_client": ["web"]}},
+]
+
+def _ytdl_base(client_idx=0):
+    return {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "extractor_args": _YT_CLIENT_FALLBACKS[client_idx % len(_YT_CLIENT_FALLBACKS)],
+    }
+
+_YTDL_BASE = _ytdl_base(0)
 
 # ---- Download log + iPhone relay (Cloudflare worker) ------------------------
 _WORKER = "https://video-downloader-log.waraichinstitute.workers.dev"
@@ -311,11 +320,28 @@ url = st.text_input("Link", value=_prefill, placeholder="Paste video or page lin
 
 
 def _fetch_info(url):
-    """Read what's available without downloading. Returns a dict."""
-    try:
-        with yt_dlp.YoutubeDL(_YTDL_BASE) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as exc:  # noqa: BLE001 - fall back to page reading
+    """Read what's available without downloading. Returns a dict.
+
+    Tries YouTube player clients in order until one works.
+    """
+    info = None
+    last_exc = None
+    for ci in range(len(_YT_CLIENT_FALLBACKS)):
+        try:
+            with yt_dlp.YoutubeDL(_ytdl_base(ci)) as ydl:
+                info = ydl.extract_info(url, download=False)
+            break
+        except Exception as exc:  # noqa: BLE001 - try next client
+            last_exc = exc
+            # Only retry with another client for YouTube bot/403 blocks;
+            # other sites fail fast.
+            low = str(exc).lower()
+            if "youtube" not in url.lower() or not (
+                    "not a bot" in low or "sign in to confirm" in low
+                    or "403" in low or "forbidden" in low):
+                break
+    if info is None:
+        exc = last_exc or Exception("unknown error")
         try:
             vids = find_page_videos(url)
         except Exception:
@@ -338,26 +364,48 @@ def _fetch_info(url):
             "thumbnail": thumb, "duration": duration}
 
 
-def _download_choice(url, fmt, audio_only, label):
-    """Download one chosen format, relay it, show the tap-to-download link."""
+def _download_choice(url, fmt, audio_only, label, pre_info=None):
+    """Download one chosen format, relay it, show the tap-to-download link.
+
+    If pre_info (already-extracted video info) is given, reuse it instead of
+    extracting again — halves YouTube requests, dodging rate limits.
+    """
     tag = uuid.uuid4().hex[:8]
     outtmpl = os.path.join(WORKDIR, f"{tag}.%(ext)s")
-    ydl_opts = dict(_YTDL_BASE)
-    ydl_opts.update({
-        "format": fmt,
-        "outtmpl": outtmpl,
-        "merge_output_format": "mp4",
-    })
-    if audio_only:
-        ydl_opts["postprocessors"] = [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }]
     with st.spinner("Downloading… big videos can take a minute."):
+        info = None
+        last_exc = None
+        # Try each YouTube client in order; reuse pre-fetched info on first try.
+        for ci in range(len(_YT_CLIENT_FALLBACKS)):
+            try:
+                opts = _ytdl_base(ci)
+                opts.update({
+                    "format": fmt,
+                    "outtmpl": outtmpl,
+                    "merge_output_format": "mp4",
+                })
+                if audio_only:
+                    opts["postprocessors"] = [{
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "192",
+                    }]
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    if pre_info and ci == 0:
+                        info = ydl.process_ie_result(dict(pre_info), download=True)
+                    else:
+                        info = ydl.extract_info(url, download=True)
+                break
+            except Exception as exc:  # noqa: BLE001 - try next client
+                last_exc = exc
+                low = str(exc).lower()
+                if "youtube" not in url.lower() or not (
+                        "not a bot" in low or "sign in to confirm" in low
+                        or "403" in low or "forbidden" in low):
+                    break
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+            if info is None:
+                raise last_exc or Exception("download failed")
             got = [f for f in os.listdir(WORKDIR) if f.startswith(tag)]
             if not got:
                 st.error("The download finished but the file went missing. Try again.")
@@ -536,7 +584,7 @@ def _show_options(url, info):
     opts.append(("🎵 Audio only (MP3)", "ba/best", True, "audio-mp3"))
     for i, (label, fmt, audio_only, mode) in enumerate(opts):
         if st.button(label, key=f"q-{i}"):
-            _download_choice(url, fmt, audio_only, mode)
+            _download_choice(url, fmt, audio_only, mode, pre_info=info["info"])
     if st.button("🔗 Direct link (for huge files)", key="q-direct"):
         _show_direct_link(url, info["info"], info["title"])
 
