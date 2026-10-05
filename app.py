@@ -4,6 +4,7 @@ import os
 import re
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -64,33 +65,53 @@ def _log_download(vurl, mode, title=""):
 def _relay_upload(path, filename, size):
     """Push the finished file to the Cloudflare relay in 20MB chunks.
 
-    Returns a tap-to-download URL (forced attachment headers) or None.
+    Uploads up to 4 chunks in parallel for speed. Returns a tap-to-download
+    URL (forced attachment headers) or None.
     """
     key = _dl_key()
     if not key:
         return None
     fid = uuid.uuid4().hex[:16]
-    total = (size + _RELAY_CHUNK - 1) // _RELAY_CHUNK
     try:
-        prog = st.progress(0, text="Preparing your iPhone download…")
         with open(path, "rb") as f:
-            for i in range(total):
-                chunk = f.read(_RELAY_CHUNK)
-                data = {"key": key, "id": fid,
-                        "index": str(i), "total": str(total)}
-                if i == 0:
-                    data["name"] = filename
-                    data["size"] = str(size)
-                r = requests.post(_CHUNK_URL, data=data,
-                                  files={"file": (f"chunk{i}", chunk)},
-                                  timeout=180)
-                if r.status_code != 200 or not r.json().get("ok"):
-                    prog.empty()
-                    return None
-                prog.progress((i + 1) / total,
-                              text=f"Preparing your iPhone download… ({i + 1}/{total})")
+            chunks = []
+            while True:
+                c = f.read(_RELAY_CHUNK)
+                if not c:
+                    break
+                chunks.append(c)
+    except Exception:
+        return None
+    total = len(chunks)
+    if total == 0:
+        return None
+
+    def _upload_one(i):
+        data = {"key": key, "id": fid,
+                "index": str(i), "total": str(total)}
+        if i == 0:
+            data["name"] = filename
+            data["size"] = str(size)
+        r = requests.post(_CHUNK_URL, data=data,
+                          files={"file": (f"chunk{i}", chunks[i])},
+                          timeout=180)
+        if r.status_code != 200 or not r.json().get("ok"):
+            raise RuntimeError(f"chunk {i} failed")
+        return i
+
+    prog = st.progress(0, text="Preparing your iPhone download…")
+    try:
+        done = 0
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            futures = {ex.submit(_upload_one, i): i for i in range(total)}
+            for fut in as_completed(futures):
+                fut.result()  # raises if that chunk failed
+                done += 1
+                prog.progress(done / total,
+                              text=f"Preparing your iPhone download… ({done}/{total})")
         prog.empty()
     except Exception:
+        prog.empty()
         return None
     return f"{_WORKER}/f/{fid}"
 
@@ -300,13 +321,17 @@ def _fetch_info(url):
         return {"kind": "error", "msg": _friendly_error(exc)}
     fmts = info.get("formats") or []
     title = (info.get("title") or "video")[:80]
+    thumb = info.get("thumbnail")
+    duration = info.get("duration")  # seconds or None
     if not fmts and info.get("url"):
         return {"kind": "direct", "title": title,
                 "file_url": info["url"],
-                "size": info.get("filesize") or info.get("filesize_approx")}
+                "size": info.get("filesize") or info.get("filesize_approx"),
+                "thumbnail": thumb, "duration": duration}
     heights = sorted({f.get("height") for f in fmts if f.get("height")},
                      reverse=True)
-    return {"kind": "formats", "title": title, "heights": heights, "info": info}
+    return {"kind": "formats", "title": title, "heights": heights, "info": info,
+            "thumbnail": thumb, "duration": duration}
 
 
 def _download_choice(url, fmt, audio_only, label):
@@ -386,6 +411,50 @@ def _show_direct_link(url, info, title):
     _iphone_tip()
 
 
+def _fmt_size(num):
+    """Human-readable file size."""
+    if not num:
+        return ""
+    if num >= 1_000_000_000:
+        return f"{num / 1_000_000_000:.1f} GB"
+    return f"{num / 1_000_000:.0f} MB"
+
+
+def _fmt_duration(secs):
+    if not secs:
+        return ""
+    secs = int(secs)
+    m, s = divmod(secs, 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _estimate_quality_sizes(info):
+    """Estimate download size for each quality from format metadata.
+
+    Returns {height: bytes}. Uses the largest reported filesize at or below
+    each height as a rough guide.
+    """
+    fmts = info.get("formats") or []
+    sizes = {}
+    for h in (1080, 720, 480, 360):
+        cands = [f for f in fmts
+                 if f.get("height") and f.get("height") <= h
+                 and (f.get("filesize") or f.get("filesize_approx"))]
+        if cands:
+            best = max(cands, key=lambda f: (f.get("height") or 0,
+                                            f.get("filesize") or f.get("filesize_approx") or 0))
+            sizes[h] = best.get("filesize") or best.get("filesize_approx")
+    # Best quality: biggest video format overall
+    vfmts = [f for f in fmts
+             if (f.get("vcodec") or "none") != "none"
+             and (f.get("filesize") or f.get("filesize_approx"))]
+    if vfmts:
+        biggest = max(vfmts, key=lambda f: f.get("filesize") or f.get("filesize_approx") or 0)
+        sizes["best"] = biggest.get("filesize") or biggest.get("filesize_approx")
+    return sizes
+
+
 def _show_options(url, info):
     kind = info["kind"]
     if kind == "error":
@@ -411,23 +480,54 @@ def _show_options(url, info):
         _iphone_tip()
         return
     if kind == "direct":
-        st.success(f"Found the file — {info['title']}")
+        thumb = info.get("thumbnail")
+        dur_txt = _fmt_duration(info.get("duration"))
+        if thumb:
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                st.image(thumb, use_container_width=True)
+            with c2:
+                st.markdown(f"**{info['title']}**")
+                if dur_txt:
+                    st.caption(f"⏱ {dur_txt}")
+        else:
+            st.success(f"Found the file — {info['title']}")
         size = info.get("size")
         if size and size > _MAX_BYTES:
             st.link_button("🔗 Open direct file link", info["file_url"])
             _iphone_tip()
-        elif st.button("⬇️ Download video", key="dl-direct"):
+        elif st.button("⬇️ Download video" + (f" (~{_fmt_size(size)})" if size else ""),
+                       key="dl-direct"):
             _download_choice(info["file_url"], "best", False, "direct-link")
         return
     # kind == "formats": the normal case — show quality choices
-    st.success(f"Found — {info['title']}")
+    thumb = info.get("thumbnail")
+    dur_txt = _fmt_duration(info.get("duration"))
+    if thumb:
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            st.image(thumb, use_container_width=True)
+        with c2:
+            st.markdown(f"**{info['title']}**")
+            if dur_txt:
+                st.caption(f"⏱ {dur_txt}")
+    else:
+        st.success(f"Found — {info['title']}")
+        if dur_txt:
+            st.caption(f"⏱ {dur_txt}")
     st.write("Pick a quality:")
     heights = info["heights"] or []
     max_h = max(heights) if heights else 0
-    opts = [("⬇️ Best quality", "bv*+ba/b/best", False, "best")]
+    sizes = _estimate_quality_sizes(info["info"])
+    opts = []
+    best_sz = _fmt_size(sizes.get("best"))
+    opts.append((f"⬇️ Best quality" + (f" (~{best_sz})" if best_sz else ""),
+                 "bv*+ba/b/best", False, "best"))
     for h in (720, 480, 360):
         if max_h >= h:
-            opts.append((f"⬇️ {h}p", f"bv*[height<={h}]+ba/b[height<={h}]/b/best",
+            sz = _fmt_size(sizes.get(h))
+            opts.append((f"⬇️ {h}p" + (f" (~{sz})" if sz else ""),
+                         f"bv*[height<={h}]+ba/b[height<={h}]/b/best",
                          False, f"{h}p"))
     opts.append(("🎵 Audio only (MP3)", "ba/best", True, "audio-mp3"))
     for i, (label, fmt, audio_only, mode) in enumerate(opts):
@@ -446,6 +546,16 @@ if st.button("⬇️ Get download options", type="primary"):
     st.session_state.vd_url = link
     with st.spinner("Reading the video…"):
         st.session_state.vd_info = _fetch_info(link)
+
+# Auto-fetch when a link arrives via ?url= (iPhone Shortcut) so one tap is enough.
+if _prefill and not st.session_state.vd_info and not st.session_state.get("vd_autofetched"):
+    st.session_state.vd_autofetched = True
+    link = _prefill.strip()
+    if re.match(r"^https?://", link, re.IGNORECASE):
+        _cleanup()
+        st.session_state.vd_url = link
+        with st.spinner("Reading the video…"):
+            st.session_state.vd_info = _fetch_info(link)
 
 if st.session_state.vd_info:
     _show_options(st.session_state.vd_url, st.session_state.vd_info)
