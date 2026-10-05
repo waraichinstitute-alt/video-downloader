@@ -20,6 +20,24 @@ _BROWSER_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) "
                "Mobile/15E148 Safari/604.1")
 _VIDEO_EXTS = ("mp4", "m3u8", "mpd", "webm", "mov", "m4v", "ogv")
 
+# ---- Download log (admin can see every download) ---------------------------
+_LOG_URL = "https://video-downloader-log.waraichinstitute.workers.dev/api/log"
+_LOG_KEY = "4fa5a0a927bfc19ccb701f330d2d8f6b7d918b2034e0d4d7"
+
+
+def _log_download(vurl, mode, title=""):
+    """Record a download for the admin log. Never breaks the download."""
+    try:
+        requests.post(_LOG_URL, json={
+            "key": _LOG_KEY,
+            "url": vurl,
+            "mode": mode,
+            "title": (title or "")[:160],
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }, timeout=6)
+    except Exception:
+        pass
+
 
 def _cleanup():
     now = time.time()
@@ -223,6 +241,7 @@ if st.button("Download", type="primary"):
                 n = len(vids)
                 st.success(f"Found {n} video{'s' if n != 1 else ''} on that page:")
                 for v in vids:
+                    _log_download(v["url"], "find-on-page", v["host"])
                     size_txt = (f" (~{v['size'] / 1_000_000:.0f} MB)"
                                 if v["size"] else " (size unknown)")
                     st.link_button(f"⬇️ Open video{size_txt} — {v['host']}", v["url"])
@@ -244,6 +263,7 @@ if st.button("Download", type="primary"):
                     title = (info.get("title") or "video")[:60]
                     size_txt = f" (~{dsize / 1_000_000:.0f} MB)" if dsize else ""
                     st.success(f"Direct link ready — {title}{size_txt}")
+                    _log_download(durl, "direct-link", title)
                     st.link_button("🔗 Open direct file link", durl)
                     low_url = url.lower()
                     if "youtube.com" in low_url or "youtu.be" in low_url:
@@ -303,6 +323,9 @@ if st.button("Download", type="primary"):
             with open(path, "rb") as f:
                 data = f.read()
             st.success(f"Done — {title} ({size / 1_000_000:.1f} MB)")
+            _log_download(url, "audio-mp3" if audio_only
+                          else "best" if quality.startswith("Best") else "720p",
+                          title)
             st.download_button("⬇️ Tap to save your file", data=data,
                                file_name=f"download.{ext}")
         except Exception as exc:  # noqa: BLE001 - surfaced nicely
