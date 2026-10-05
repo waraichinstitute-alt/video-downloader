@@ -114,6 +114,9 @@ def _friendly_error(exc: Exception) -> str:
     if "sign in to confirm" in low or "not a bot" in low:
         return ("YouTube asked for bot verification on this one. "
                 "Wait a bit and try again, or try a different video.")
+    if "403" in low or "forbidden" in low:
+        return ("YouTube refused the download (their bot protection). "
+                "Wait a while and try again, or try a different video.")
     if "drm" in low or "encrypted" in low:
         return "This video is DRM-protected (like Netflix/Spotify). No downloader can grab those."
     if "login required" in low or "log in" in low:
