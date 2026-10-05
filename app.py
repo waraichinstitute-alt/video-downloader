@@ -194,6 +194,11 @@ def _pick_direct(info):
             best.get("ext") or "", is_hls)
 
 
+def _iphone_tip():
+    st.caption("📱 iPhone tip: if the video plays instead of saving, tap **Share → Save to Files**. "
+               "Or long-press the button → **Download Linked File**.")
+
+
 # ---- UI -------------------------------------------------------------------
 
 st.set_page_config(page_title="Video Downloader", page_icon="⬇️")
@@ -247,6 +252,7 @@ if st.button("Download", type="primary"):
                     st.link_button(f"⬇️ Open video{size_txt} — {v['host']}", v["url"])
                     if v["ext"] == "m3u8":
                         st.caption("Stream link — your iPhone can play it but not save it.")
+                _iphone_tip()
         st.stop()
 
     if quality.startswith("Direct"):
@@ -277,6 +283,7 @@ if st.button("Download", type="primary"):
                         st.caption("Your phone downloads straight from the source, "
                                    "so there's no size limit. Use it soon — these "
                                    "links expire after a while.")
+                    _iphone_tip()
             except Exception as exc:  # noqa: BLE001 - surfaced nicely
                 st.error(_friendly_error(exc))
         st.stop()
@@ -328,5 +335,6 @@ if st.button("Download", type="primary"):
                           title)
             st.download_button("⬇️ Tap to save your file", data=data,
                                file_name=f"download.{ext}")
+            _iphone_tip()
         except Exception as exc:  # noqa: BLE001 - surfaced nicely
             st.error(_friendly_error(exc))
