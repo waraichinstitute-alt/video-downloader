@@ -138,6 +138,10 @@ def _friendly_error(exc: Exception) -> str:
     if "403" in low or "forbidden" in low:
         return ("YouTube refused the download (their bot protection). "
                 "Wait a while and try again, or try a different video.")
+    if "429" in low or "too many requests" in low:
+        return ("Instagram is limiting requests right now (too many from this "
+                "server). Wait 10–15 minutes and try again — this usually "
+                "clears on its own.")
     if "drm" in low or "encrypted" in low:
         return "This video is DRM-protected (like Netflix/Spotify). No downloader can grab those."
     if "login required" in low or "log in" in low:
