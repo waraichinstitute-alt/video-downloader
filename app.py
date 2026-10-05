@@ -20,6 +20,15 @@ _BROWSER_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) "
                "Mobile/15E148 Safari/604.1")
 _VIDEO_EXTS = ("mp4", "m3u8", "mpd", "webm", "mov", "m4v", "ogv")
 
+# YouTube blocks datacenter IPs with "Sign in to confirm you're not a bot".
+# The android player client bypasses it (falls back to web client).
+_YTDL_BASE = {
+    "quiet": True,
+    "no_warnings": True,
+    "noplaylist": True,
+    "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+}
+
 # ---- Download log + iPhone relay (Cloudflare worker) ------------------------
 _WORKER = "https://video-downloader-log.waraichinstitute.workers.dev"
 _LOG_URL = f"{_WORKER}/api/log"
@@ -276,8 +285,7 @@ url = st.text_input("Link", value=_prefill, placeholder="Paste video or page lin
 def _fetch_info(url):
     """Read what's available without downloading. Returns a dict."""
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True,
-                               "noplaylist": True}) as ydl:
+        with yt_dlp.YoutubeDL(_YTDL_BASE) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:  # noqa: BLE001 - fall back to page reading
         try:
@@ -302,14 +310,12 @@ def _download_choice(url, fmt, audio_only, label):
     """Download one chosen format, relay it, show the tap-to-download link."""
     tag = uuid.uuid4().hex[:8]
     outtmpl = os.path.join(WORKDIR, f"{tag}.%(ext)s")
-    ydl_opts = {
+    ydl_opts = dict(_YTDL_BASE)
+    ydl_opts.update({
         "format": fmt,
         "outtmpl": outtmpl,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
         "merge_output_format": "mp4",
-    }
+    })
     if audio_only:
         ydl_opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
