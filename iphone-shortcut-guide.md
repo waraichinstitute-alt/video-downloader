@@ -37,8 +37,8 @@ completion(urls);
 1. In Safari, open any page with a video.
 2. Tap **Share** → **Send video to downloader**.
 3. Pick the video from the list (if there is more than one).
-4. Our site opens with the link filled in and Direct link mode selected —
-   tap **Download**, then open the file link to save it.
+4. Our site opens with the link filled in — tap **Get download options**,
+   pick a quality, then tap **Download to iPhone** to save it.
 
 ## Honest limits
 - If the Shortcut finds no addresses, the player uses a scrambled or

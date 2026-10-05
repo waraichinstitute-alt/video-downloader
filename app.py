@@ -252,98 +252,56 @@ def _iphone_tip():
 
 st.set_page_config(page_title="Video Downloader", page_icon="⬇️")
 st.title("⬇️ Video Downloader")
-st.caption("Paste a link, get the file. YouTube, TikTok, Instagram, X and a thousand more "
-           "sites. Won't work on Netflix, Spotify or Disney+ (DRM-protected). "
-           "Got a huge file? Use “Direct link (big files)” — your phone grabs it "
-           "straight from the source with no size limit. "
-           "See a video playing on some page? “Find video on page” hunts it down in the page's code.")
+st.caption("Paste a link, tap the button, pick your quality. Works on YouTube, "
+           "TikTok, Instagram, X and a thousand more sites. "
+           "Won't work on Netflix, Spotify or Disney+ (DRM-protected).")
 
 # Optional ?url= prefill (lets an iPhone Shortcut hand a link straight in).
 _prefill = st.query_params.get("url", "") or ""
-_modes = ["720p or smaller", "Best quality", "Audio only (MP3)",
-          "Direct link (big files)", "🔍 Find video on page"]
-_default_mode = ("Direct link (big files)" if _looks_like_video(_prefill)
-                 else "720p or smaller")
 
-url = st.text_input("Link", value=_prefill, placeholder="Paste video or page link…")
-quality = st.radio("Mode", _modes, index=_modes.index(_default_mode))
+if "vd_info" not in st.session_state:
+    st.session_state.vd_info = None
+if "vd_url" not in st.session_state:
+    st.session_state.vd_url = ""
 
-if st.button("Download", type="primary"):
-    url = (url or "").strip()
-    if not re.match(r"^https?://", url, re.IGNORECASE):
-        st.error("Paste a valid link starting with http(s)://")
-        st.stop()
-    _cleanup()
 
-    if quality.startswith("🔍"):
-        with st.spinner("Reading the page and hunting for videos…"):
-            try:
-                vids = find_page_videos(url)
-            except requests.RequestException:
-                st.error("That page blocks automatic reading (bot protection). "
-                         "Your phone's browser is the only thing allowed in there, "
-                         "so the server can't see its videos.")
-                st.stop()
-            except Exception as exc:  # noqa: BLE001 - surfaced nicely
-                st.error(_friendly_error(exc))
-                st.stop()
-            if not vids:
-                st.warning("No downloadable videos found in that page's code. "
-                           "Its player probably builds the video with live scripts, "
-                           "which only your phone's browser can see — the server can't.")
-            else:
-                n = len(vids)
-                st.success(f"Found {n} video{'s' if n != 1 else ''} on that page:")
-                for v in vids:
-                    _log_download(v["url"], "find-on-page", v["host"])
-                    size_txt = (f" (~{v['size'] / 1_000_000:.0f} MB)"
-                                if v["size"] else " (size unknown)")
-                    st.link_button(f"⬇️ Open video{size_txt} — {v['host']}", v["url"])
-                    if v["ext"] == "m3u8":
-                        st.caption("Stream link — your iPhone can play it but not save it.")
-                _iphone_tip()
-        st.stop()
+def _url_changed():
+    st.session_state.vd_info = None
 
-    if quality.startswith("Direct"):
-        with st.spinner("Finding the direct file link…"):
-            try:
-                with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True,
-                                       "noplaylist": True}) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                durl, dsize, _dext, is_hls = _pick_direct(info)
-                if not durl:
-                    st.error("No direct file link found for that page — "
-                             "try a download option instead.")
-                else:
-                    title = (info.get("title") or "video")[:60]
-                    size_txt = f" (~{dsize / 1_000_000:.0f} MB)" if dsize else ""
-                    st.success(f"Direct link ready — {title}{size_txt}")
-                    _log_download(durl, "direct-link", title)
-                    st.link_button("🔗 Open direct file link", durl)
-                    low_url = url.lower()
-                    if "youtube.com" in low_url or "youtu.be" in low_url:
-                        st.warning("YouTube locks these links to this server, so it "
-                                   "won't open on your phone. For YouTube use a "
-                                   "download option (up to 250 MB).")
-                    elif is_hls:
-                        st.info("That's a stream link — your iPhone can play it but "
-                                "not save it. Use a download option to get a real file.")
-                    else:
-                        st.caption("Your phone downloads straight from the source, "
-                                   "so there's no size limit. Use it soon — these "
-                                   "links expire after a while.")
-                    _iphone_tip()
-            except Exception as exc:  # noqa: BLE001 - surfaced nicely
-                st.error(_friendly_error(exc))
-        st.stop()
 
+url = st.text_input("Link", value=_prefill, placeholder="Paste video or page link…",
+                    key="vd_link", on_change=_url_changed)
+
+
+def _fetch_info(url):
+    """Read what's available without downloading. Returns a dict."""
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True,
+                               "noplaylist": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:  # noqa: BLE001 - fall back to page reading
+        try:
+            vids = find_page_videos(url)
+        except Exception:
+            vids = []
+        if vids:
+            return {"kind": "page", "videos": vids}
+        return {"kind": "error", "msg": _friendly_error(exc)}
+    fmts = info.get("formats") or []
+    title = (info.get("title") or "video")[:80]
+    if not fmts and info.get("url"):
+        return {"kind": "direct", "title": title,
+                "file_url": info["url"],
+                "size": info.get("filesize") or info.get("filesize_approx")}
+    heights = sorted({f.get("height") for f in fmts if f.get("height")},
+                     reverse=True)
+    return {"kind": "formats", "title": title, "heights": heights, "info": info}
+
+
+def _download_choice(url, fmt, audio_only, label):
+    """Download one chosen format, relay it, show the tap-to-download link."""
     tag = uuid.uuid4().hex[:8]
     outtmpl = os.path.join(WORKDIR, f"{tag}.%(ext)s")
-    audio_only = quality.startswith("Audio")
-    fmt = ("ba/best" if audio_only
-           else "bv*+ba/b/best" if quality.startswith("Best")
-           else "bv*[height<=720]+ba/b[height<=720]/b/best")
-
     ydl_opts = {
         "format": fmt,
         "outtmpl": outtmpl,
@@ -358,7 +316,6 @@ if st.button("Download", type="primary"):
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }]
-
     with st.spinner("Downloading… big videos can take a minute."):
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -366,22 +323,20 @@ if st.button("Download", type="primary"):
             got = [f for f in os.listdir(WORKDIR) if f.startswith(tag)]
             if not got:
                 st.error("The download finished but the file went missing. Try again.")
-                st.stop()
+                return
             name = max(got, key=lambda f: os.path.getmtime(os.path.join(WORKDIR, f)))
             path = os.path.join(WORKDIR, name)
             size = os.path.getsize(path)
             if size > _MAX_BYTES:
-                st.error("That file is too big for the free server — "
-                         "try “Direct link (big files)” instead.")
-                st.stop()
+                st.error("That file is too big for the free server (250 MB) — "
+                         "pick a lower quality instead.")
+                return
             ext = name.rsplit(".", 1)[-1]
             title = (info.get("title") or "video")[:60]
             safe = re.sub(r"[^a-zA-Z0-9_-]+", "_", title).strip("_")[:40] or "video"
             filename = f"{safe}_{tag}.{ext}"
             st.success(f"Done — {title} ({size / 1_000_000:.1f} MB)")
-            _log_download(url, "audio-mp3" if audio_only
-                          else "best" if quality.startswith("Best") else "720p",
-                          title)
+            _log_download(url, label, title)
             # Relay the file to Cloudflare so the iPhone gets a forced
             # download (tap the link — no long-press needed).
             dl_url = _relay_upload(path, filename, size)
@@ -397,3 +352,91 @@ if st.button("Download", type="primary"):
                 _iphone_tip()
         except Exception as exc:  # noqa: BLE001 - surfaced nicely
             st.error(_friendly_error(exc))
+
+
+def _show_direct_link(url, info, title):
+    """Reveal the raw file link (for huge files the server can't handle)."""
+    durl, dsize, _dext, is_hls = _pick_direct(info)
+    if not durl:
+        st.error("No direct file link found for that page.")
+        return
+    size_txt = f" (~{dsize / 1_000_000:.0f} MB)" if dsize else ""
+    st.success(f"Direct link ready — {title}{size_txt}")
+    _log_download(durl, "direct-link", title)
+    st.link_button("🔗 Open direct file link", durl)
+    low_url = url.lower()
+    if "youtube.com" in low_url or "youtu.be" in low_url:
+        st.warning("YouTube locks these links to this server, so it won't open "
+                   "on your phone. Pick a download quality instead (up to 250 MB).")
+    elif is_hls:
+        st.info("That's a stream link — your iPhone can play it but not save it. "
+                "Pick a download quality to get a real file.")
+    else:
+        st.caption("Your phone downloads straight from the source, so there's no "
+                   "size limit. Use it soon — these links expire after a while.")
+    _iphone_tip()
+
+
+def _show_options(url, info):
+    kind = info["kind"]
+    if kind == "error":
+        st.error(info["msg"])
+        return
+    if kind == "page":
+        vids = info["videos"]
+        n = len(vids)
+        st.success(f"Found {n} video{'s' if n != 1 else ''} on that page — pick one:")
+        for i, v in enumerate(vids):
+            size_txt = (f" (~{v['size'] / 1_000_000:.0f} MB)" if v["size"] else "")
+            if st.button(f"⬇️ Video{size_txt} — {v['host']}", key=f"pv-{i}"):
+                if v["ext"] == "m3u8":
+                    _log_download(v["url"], "find-on-page", v["host"])
+                    st.info("That's a stream link — your iPhone can play it but not save it.")
+                    st.link_button("🔗 Open stream link", v["url"])
+                elif v["size"] and v["size"] > _MAX_BYTES:
+                    _log_download(v["url"], "find-on-page", v["host"])
+                    st.link_button("🔗 Open direct file link", v["url"])
+                    _iphone_tip()
+                else:
+                    _download_choice(v["url"], "best", False, "find-on-page")
+        _iphone_tip()
+        return
+    if kind == "direct":
+        st.success(f"Found the file — {info['title']}")
+        size = info.get("size")
+        if size and size > _MAX_BYTES:
+            st.link_button("🔗 Open direct file link", info["file_url"])
+            _iphone_tip()
+        elif st.button("⬇️ Download video", key="dl-direct"):
+            _download_choice(info["file_url"], "best", False, "direct-link")
+        return
+    # kind == "formats": the normal case — show quality choices
+    st.success(f"Found — {info['title']}")
+    st.write("Pick a quality:")
+    heights = info["heights"] or []
+    max_h = max(heights) if heights else 0
+    opts = [("⬇️ Best quality", "bv*+ba/b/best", False, "best")]
+    for h in (720, 480, 360):
+        if max_h >= h:
+            opts.append((f"⬇️ {h}p", f"bv*[height<={h}]+ba/b[height<={h}]/b/best",
+                         False, f"{h}p"))
+    opts.append(("🎵 Audio only (MP3)", "ba/best", True, "audio-mp3"))
+    for i, (label, fmt, audio_only, mode) in enumerate(opts):
+        if st.button(label, key=f"q-{i}"):
+            _download_choice(url, fmt, audio_only, mode)
+    if st.button("🔗 Direct link (for huge files)", key="q-direct"):
+        _show_direct_link(url, info["info"], info["title"])
+
+
+if st.button("⬇️ Get download options", type="primary"):
+    link = (st.session_state.vd_link or "").strip()
+    if not re.match(r"^https?://", link, re.IGNORECASE):
+        st.error("Paste a valid link starting with http(s)://")
+        st.stop()
+    _cleanup()
+    st.session_state.vd_url = link
+    with st.spinner("Reading the video…"):
+        st.session_state.vd_info = _fetch_info(link)
+
+if st.session_state.vd_info:
+    _show_options(st.session_state.vd_url, st.session_state.vd_info)
